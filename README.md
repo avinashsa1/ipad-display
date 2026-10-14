@@ -18,7 +18,7 @@ You drag windows from your laptop screen onto the iPad, just like a plugged-in d
 cd ~/workspace/ipad-extended-display
 chmod +x ipad-display
 
-# 1. Install Sunshine + helpers, open firewall ports (one time, needs sudo)
+# 1. Install: compiles Sunshine from the official upstream source (one time, needs sudo)
 ./ipad-display install
 
 # 2. Create the virtual display and start streaming
@@ -27,6 +27,30 @@ chmod +x ipad-display
 # 3. Follow the printed pairing steps on your iPad, then:
 ./ipad-display stop    # turn the virtual monitor back off when done
 ./ipad-display status  # diagnose anything
+```
+
+### Trust model: no prebuilt binaries
+
+`install` **compiles Sunshine from source on your machine**. The only thing downloaded
+is the official upstream code — `https://github.com/LizardByte/Sunshine` at its latest
+release tag (resolved at install time) — plus Fedora build dependencies from the
+official list in LizardByte's own `scripts/linux_build.sh`. Nothing prebuilt ever
+touches your system.
+
+What to expect on first install:
+
+- ~2–3 GB of build dependencies via `dnf` (one time)
+- 10–25 minutes of compiling on a typical laptop (one time; re-runs are skipped
+  unless the tag changes)
+- The result is installed to `/usr/local` (binary: `/usr/local/bin/sunshine`)
+
+Install flags:
+
+```bash
+./ipad-display install --binary                  # fast path: LizardByte COPR RPM instead
+./ipad-display install --rebuild                  # force a clean rebuild
+./ipad-display install --sunshine-version v2025.1018.200218   # pin a specific tag
+SUNSHINE_VERSION=v2025.1018.200218 ./ipad-display install     # same via env var
 ```
 
 ### Pairing cheat-sheet (also printed by `./ipad-display pair`)
@@ -94,14 +118,29 @@ most home networks.
 
 ## Uninstall
 
+**If you installed from source** (default): the build left an install manifest —
+remove exactly what was installed, then drop the source tree:
+
+```bash
+sudo xargs rm -f < ~/.cache/ipad-display/sunshine-src/build/install_manifest.txt
+rm -rf ~/.cache/ipad-display
+```
+
+Then, in both cases:
+
 ```bash
 ./ipad-display stop
-sudo dnf remove Sunshine
-sudo dnf copr disable lizardbyte/stable
 sudo firewall-cmd --permanent --remove-port=47984/tcp --remove-port=47989/tcp \
   --remove-port=47990/tcp --remove-port=48010/tcp --remove-port=47998-48010/udp
 sudo firewall-cmd --reload
 rm -rf ~/.config/sunshine
+```
+
+**If you used `--binary`** instead, also run:
+
+```bash
+sudo dnf remove Sunshine
+sudo dnf copr disable lizardbyte/stable
 ```
 
 ## Security notes

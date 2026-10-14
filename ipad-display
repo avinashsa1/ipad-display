@@ -13,11 +13,19 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 DEFAULT_RES="1920x1440"
 DEFAULT_POS="right"
 DEFAULT_SCALE="1.0"
 SUNSHINE_CONF="${HOME}/.config/sunshine/sunshine.conf"
+
+# Sunshine is compiled from the official upstream source — no prebuilt binaries.
+# Only trust anchor: https://github.com/LizardByte/Sunshine at the tag below.
+# Override with:  SUNSHINE_VERSION=v2025.1018.200218 ./ipad-display install
+SUNSHINE_REPO="https://github.com/LizardByte/Sunshine.git"
+SUNSHINE_VERSION="${SUNSHINE_VERSION:-latest}"
+SUNSHINE_SRC_DIR="${HOME}/.cache/ipad-display/sunshine-src"
+SUNSHINE_STAMP="${SUNSHINE_SRC_DIR}/.ipad-display-built-tag"
 
 # ---------- pretty output ----------
 if [ -t 1 ]; then
@@ -44,7 +52,10 @@ usage() {
 ${C_BOLD}ipad-display${C_RESET} v${VERSION} — iPad as a wireless extended display (Fedora laptop)
 
 ${C_BOLD}Commands:${C_RESET}
-  install                 Install Sunshine + helpers, open firewall ports
+  install [--from-source|--binary] [--sunshine-version TAG] [--rebuild]
+                          Install everything. Default: compile Sunshine from the
+                          official upstream source (pinned release tag).
+                          --binary uses the LizardByte COPR RPM instead (fast).
   start [--res WxH] [--pos right|left|above|below] [--scale S] [--output N] [--monitor-only]
                           Create the virtual monitor and start streaming it
   stop                    Turn the virtual monitor back off
@@ -63,22 +74,145 @@ EOF
 }
 
 # =====================================================================
-# install
+# install — Sunshine is compiled from official upstream source (no binaries)
 # =====================================================================
+
+# Official Fedora build-dependency list, taken from LizardByte's own
+# scripts/linux_build.sh (function add_fedora_deps). Kept in sync manually;
+# if the upstream script changes, update this list.
+sunshine_install_build_deps() {
+  step "Installing Sunshine build dependencies (upstream's official Fedora list)"
+  local fedora_ver
+  fedora_ver=$(rpm -E %fedora 2>/dev/null || echo 0)
+
+  local -a deps=(
+    appstream cmake desktop-file-utils doxygen gcc gcc-c++ git glslc graphviz
+    ImageMagick libappstream-glib libcap-devel libcurl-devel libdrm-devel
+    libevdev-devel libX11-devel libxcb-devel libXcursor-devel libXfixes-devel
+    libXi-devel libXinerama-devel libXrandr-devel libXtst-devel
+    mesa-libGL-devel mesa-libgbm-devel miniupnpc-devel ninja-build npm
+    numactl-devel openssl-devel opus-devel pipewire-devel pulseaudio-libs-devel
+    python3-jinja2 qt6-qtbase-devel qt6-qtsvg-devel rpm-build vulkan-loader-devel
+    wget which xorg-x11-server-Xvfb libva-devel
+  )
+  # Upstream: Fedora 44+ needs these for the Boost version it requires.
+  if [ "$fedora_ver" -ge 44 ] 2>/dev/null; then
+    deps+=(boost-devel boost-static)
+  fi
+
+  sudo dnf group install -y "development-tools"
+  sudo dnf install -y "${deps[@]}"
+
+  local gcc_major
+  gcc_major=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+  if [ -n "$gcc_major" ] && [ "$gcc_major" -lt 14 ] 2>/dev/null; then
+    warn "gcc $gcc_major is older than the GCC 14+ Sunshine wants — the build may fail."
+  fi
+  ok "Build dependencies installed."
+}
+
+# Resolve "latest" to the newest v* release tag upstream.
+resolve_sunshine_tag() { # $1 = "latest" or explicit tag -> prints tag
+  local want="$1"
+  if [ "$want" != "latest" ]; then
+    echo "$want"
+    return 0
+  fi
+  info "Resolving the latest Sunshine release tag…"
+  local tag
+  tag=$(git ls-remote --tags --sort=-v:refname "$SUNSHINE_REPO" 'v*' 2>/dev/null \
+    | grep -v '\^{}' | head -n1 | sed 's/.*refs\/tags\///')
+  [ -n "$tag" ] || die "Could not list Sunshine tags from $SUNSHINE_REPO (network issue?)."
+  info "Latest release: $tag"
+  echo "$tag"
+}
+
+install_sunshine_from_source() { # $1 = tag
+  local tag="$1"
+
+  if have sunshine && [ -f "$SUNSHINE_STAMP" ] && [ "$(cat "$SUNSHINE_STAMP")" = "$tag" ]; then
+    ok "Sunshine $tag is already built from source here — skipping (use --rebuild to force)."
+    return 0
+  fi
+
+  step "Cloning Sunshine $tag from official upstream"
+  rm -rf "$SUNSHINE_SRC_DIR"
+  mkdir -p "$(dirname "$SUNSHINE_SRC_DIR")"
+  git clone --depth 1 --branch "$tag" --recurse-submodules --shallow-submodules \
+    "$SUNSHINE_REPO" "$SUNSHINE_SRC_DIR" \
+    || die "Failed to clone Sunshine tag $tag. Check the tag exists: ${SUNSHINE_REPO%.git}/releases"
+  ok "Source is 100% upstream LizardByte code at tag $tag — nothing prebuilt."
+
+  step "Compiling Sunshine $tag (10–25 min on a laptop, one time only)"
+  (
+    cd "$SUNSHINE_SRC_DIR"
+    cmake -B build -G Ninja -S . \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_WERROR=OFF \
+      -DBUILD_DOCS=OFF \
+      -DBUILD_TESTS=OFF \
+      -DSUNSHINE_ENABLE_CUDA=OFF \
+      -DSUNSHINE_ENABLE_DRM=ON \
+      -DSUNSHINE_ENABLE_KWIN=ON \
+      -DSUNSHINE_ENABLE_PORTAL=ON \
+      -DSUNSHINE_ENABLE_WAYLAND=ON \
+      -DSUNSHINE_ENABLE_X11=ON
+    cmake --build build -j"$(nproc)"
+  ) || die "Sunshine build failed — the cmake/ninja error above says what is missing."
+
+  step "Installing the locally-built Sunshine to /usr/local"
+  sudo cmake --install "$SUNSHINE_SRC_DIR/build"
+  hash -r
+  have sunshine || die "Install step finished but 'sunshine' is not on PATH."
+  echo "$tag" > "$SUNSHINE_STAMP"
+  ok "Installed: $(sunshine --version 2>/dev/null | head -n1 || echo sunshine) (compiled on this machine)"
+  info "To uninstall later: sudo xargs rm -f < $SUNSHINE_SRC_DIR/build/install_manifest.txt"
+}
+
+install_sunshine_binary() {
+  if [ -x /usr/local/bin/sunshine ]; then
+    warn "A source-built Sunshine exists at /usr/local/bin/sunshine — the RPM would shadow/conflict with it."
+    warn "Remove it first (see README uninstall section) or re-run without --binary."
+  fi
+  info "Enabling the official LizardByte COPR and installing the prebuilt RPM…"
+  sudo dnf copr enable -y lizardbyte/stable
+  # NOTE: the package name is case-sensitive.
+  sudo dnf install -y Sunshine
+}
+
 cmd_install() {
+  local mode="source" rebuild=0
+  local want_version="$SUNSHINE_VERSION"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-source) mode="source"; shift ;;
+      --binary) mode="binary"; shift ;;
+      --sunshine-version) want_version="$2"; shift 2 ;;
+      --rebuild) rebuild=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (see: ipad-display install --help)" ;;
+    esac
+  done
+
   step "Installing dependencies"
   have dnf || die "dnf not found — this tool targets Fedora."
 
-  info "Requesting sudo up front (COPR + packages + firewall)…"
+  info "Requesting sudo up front (packages + firewall)…"
   sudo -v || die "Need sudo for installation."
 
-  if ! have sunshine; then
-    info "Enabling the official LizardByte COPR and installing Sunshine…"
-    sudo dnf copr enable -y lizardbyte/stable
-    # NOTE: the package name is case-sensitive.
-    sudo dnf install -y Sunshine
+  if [ "$mode" = "binary" ]; then
+    if ! have sunshine; then
+      install_sunshine_binary
+    else
+      ok "Sunshine already installed ($(sunshine --version 2>/dev/null | head -n1 || echo unknown))."
+    fi
   else
-    ok "Sunshine already installed ($(sunshine --version 2>/dev/null | head -n1 || echo unknown))."
+    sunshine_install_build_deps
+    local tag
+    tag=$(resolve_sunshine_tag "$want_version")
+    [ "$rebuild" -eq 1 ] && rm -f "$SUNSHINE_STAMP"
+    install_sunshine_from_source "$tag"
   fi
 
   if ! have xrandr || ! have cvt; then
@@ -386,7 +520,16 @@ cmd_stop() {
 cmd_status() {
   step "ipad-display status"
   printf '  Session:      %s on %s\n' "${XDG_CURRENT_DESKTOP:-?}" "${XDG_SESSION_TYPE:-?}"
-  printf '  Sunshine:     %s\n' "$(have sunshine && echo "installed" || echo "${C_RED}not installed${C_RESET} (run: ipad-display install)")"
+  local sunshine_info
+  if have sunshine; then
+    sunshine_info="$(sunshine --version 2>/dev/null | head -n1 || echo installed)"
+    if [ -f "$SUNSHINE_STAMP" ]; then
+      sunshine_info="$sunshine_info (built from source, tag $(cat "$SUNSHINE_STAMP"))"
+    fi
+  else
+    sunshine_info="${C_RED}not installed${C_RESET} (run: ipad-display install)"
+  fi
+  printf '  Sunshine:     %s\n' "$sunshine_info"
   printf '  Running:      %s\n' "$(pgrep -x sunshine >/dev/null 2>&1 && echo yes || echo no)"
   if [ -f "$SUNSHINE_CONF" ]; then
     printf '  output_name:  %s\n' "$(grep -E '^[[:space:]]*output_name' "$SUNSHINE_CONF" | tail -n1 || echo '(not set)')"
