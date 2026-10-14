@@ -13,7 +13,7 @@
 #
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 DEFAULT_RES="1920x1440"
 DEFAULT_POS="right"
 DEFAULT_SCALE="1.0"
@@ -36,8 +36,8 @@ if [ -t 1 ]; then
 else
   C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""; C_DIM=""; C_RESET=""
 fi
-info() { printf '%s=>%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
-ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+info() { printf '%s=>%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
 warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -145,9 +145,16 @@ install_sunshine_from_source() { # $1 = tag
   step "Cloning Sunshine $tag from official upstream"
   rm -rf "$SUNSHINE_SRC_DIR"
   mkdir -p "$(dirname "$SUNSHINE_SRC_DIR")"
-  git clone --depth 1 --branch "$tag" --recurse-submodules --shallow-submodules \
-    "$SUNSHINE_REPO" "$SUNSHINE_SRC_DIR" \
-    || die "Failed to clone Sunshine tag $tag. Check the tag exists: ${SUNSHINE_REPO%.git}/releases"
+  local clone_log
+  clone_log=$(mktemp)
+  if ! git clone --depth 1 --branch "$tag" --recurse-submodules --shallow-submodules \
+      "$SUNSHINE_REPO" "$SUNSHINE_SRC_DIR" >"$clone_log" 2>&1; then
+    err "git clone failed — its output:"
+    tail -n 15 "$clone_log" >&2
+    rm -f "$clone_log"
+    die "Failed to clone Sunshine tag $tag. Check the tag exists: ${SUNSHINE_REPO%.git}/releases"
+  fi
+  rm -f "$clone_log"
   ok "Source is 100% upstream LizardByte code at tag $tag — nothing prebuilt."
 
   step "Compiling Sunshine $tag (10–25 min on a laptop, one time only)"
