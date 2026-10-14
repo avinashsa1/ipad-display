@@ -13,7 +13,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 DEFAULT_RES="1920x1440"
 DEFAULT_POS="right"
 DEFAULT_SCALE="1.0"
@@ -332,19 +332,29 @@ wayland_create_virtual() { # W H SCALE -> sets VIRT_INDEX
   introspect=$(gdbus introspect --session --dest "$bus" --object-path "$obj" 2>/dev/null) \
     || die "Cannot reach mutter on D-Bus. This path needs a GNOME/Wayland session."
 
-  echo "$introspect" | grep -q 'name="CreateVirtualMonitor"' \
-    || die "Your mutter has no CreateVirtualMonitor API.
+  # NOTE: `gdbus introspect` prints a pretty text format, e.g.:
+  #     CreateVirtualMonitor(in  u width,
+  #                          in  u height,
+  #                          in  d scale);
+  # (not raw D-Bus XML), so parse that.
+  local method_block
+  method_block=$(echo "$introspect" | awk '
+    /^[[:space:]]*CreateVirtualMonitor\(/ { capture=1 }
+    capture { buf = buf $0 "\n" }
+    capture && /\);/ { printf "%s", buf; exit }
+  ')
+  [ -n "$method_block" ] || die "Your mutter has no CreateVirtualMonitor API.
 
+Your GNOME/mutter may be too old, or this isn't a standard GNOME session.
 Options:
   • Log into a GNOME/X11 session instead (xrandr VIRTUAL path).
   • Or use a cheap (~\$8) HDMI dummy plug, which works everywhere."
 
-  # Read the method's input signature so we call it correctly, e.g. "u u d".
+  # Input signature, e.g. "u u d".
   local sig
-  sig=$(echo "$introspect" \
-    | awk '/<method name="CreateVirtualMonitor">/,/<\/method>/' \
-    | grep 'direction="in"' \
-    | sed -n 's/.*type="\([a-z]\)".*/\1/p' | tr '\n' ' ' | sed 's/ $//')
+  sig=$(echo "$method_block" | grep -o 'in[[:space:]]\+[a-z]' | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
+  [ -n "$sig" ] || die "Found CreateVirtualMonitor but could not parse its signature.
+Please share the output of: ipad-display status"
 
   local -a args=()
   case "$sig" in
@@ -366,7 +376,7 @@ and I'll adapt the call."
   after=$(xrandr --listmonitors 2>/dev/null || true)
 
   VIRT_INDEX=$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort) \
-    | head -n1 | awk '{print $1}' | tr -d ':')
+    | grep -E '^[[:space:]]*[0-9]+:' | head -n1 | awk '{print $1}' | tr -d ':')
   if [ -z "$VIRT_INDEX" ]; then
     # Fallback: match by geometry.
     VIRT_INDEX=$(echo "$after" | grep -E "[[:space:]]${w}/[0-9]+x${h}/" \
