@@ -13,7 +13,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 DEFAULT_RES="1920x1440"
 DEFAULT_POS="right"
 DEFAULT_SCALE="1.0"
@@ -26,6 +26,8 @@ SUNSHINE_REPO="https://github.com/LizardByte/Sunshine.git"
 SUNSHINE_VERSION="${SUNSHINE_VERSION:-latest}"
 SUNSHINE_SRC_DIR="${HOME}/.cache/ipad-display/sunshine-src"
 SUNSHINE_STAMP="${SUNSHINE_SRC_DIR}/.ipad-display-built-tag"
+STATE_DIR="${HOME}/.cache/ipad-display"
+MONITOR_SNAPSHOT="${STATE_DIR}/monitors.before"
 
 # ---------- pretty output ----------
 if [ -t 1 ]; then
@@ -57,7 +59,12 @@ ${C_BOLD}Commands:${C_RESET}
                           official upstream source (pinned release tag).
                           --binary uses the LizardByte COPR RPM instead (fast).
   start [--res WxH] [--pos right|left|above|below] [--scale S] [--output N] [--monitor-only]
-                          Create the virtual monitor and start streaming it
+                          Create the virtual monitor and start streaming it.
+                          (On current GNOME: prepares everything, then asks
+                          you to connect a dummy HDMI plug / switch session.)
+  attach [--res WxH] [--output N]
+                          After `start` on GNOME: bind Sunshine to the newly
+                          connected display (dummy plug) and start streaming
   stop                    Turn the virtual monitor back off
   status                  Show session, monitors, Sunshine and network state
   pair                    Re-print the iPad (Moonlight) pairing steps
@@ -244,6 +251,34 @@ cmd_install() {
 }
 
 # =====================================================================
+# xrandr helpers
+# =====================================================================
+
+# Ensure a ${W}x${H}@60 mode exists and is attached to $output; prints mode name.
+xrandr_ensure_mode() { # output W H
+  local output="$1" w="$2" h="$3"
+  local mode_name="${w}x${h}_60.00"
+  if ! xrandr | grep -q "$mode_name"; then
+    info "Creating ${mode_name} mode…"
+    local modeline name rest
+    if have cvt; then
+      modeline=$(cvt "$w" "$h" 60 | grep Modeline)
+    elif have gtf; then
+      modeline=$(gtf "$w" "$h" 60 | grep Modeline)
+    else
+      die "Neither cvt nor gtf found. Run: ipad-display install"
+    fi
+    # shellcheck disable=SC2086
+    read -r _ name rest <<< "$modeline"
+    name=${name//\"/}
+    # shellcheck disable=SC2086
+    xrandr --newmode "$name" $rest
+  fi
+  xrandr --addmode "$output" "$mode_name" 2>/dev/null || true
+  echo "$mode_name"
+}
+
+# =====================================================================
 # X11: virtual monitor via xrandr VIRTUAL outputs (Intel iGPUs)
 # =====================================================================
 x11_create_virtual() { # W H POS  -> sets VIRT_INDEX
@@ -266,27 +301,11 @@ Options:
   [ -n "$primary" ] || primary=$(xrandr | grep ' connected' | head -n1 | awk '{print $1}')
   [ -n "$primary" ] || die "No connected display found?!"
 
-  local mode_name="${w}x${h}_60.00"
+  local mode_name
+  mode_name=$(xrandr_ensure_mode "$virt_out" "$w" "$h")
   if xrandr | grep -q " connected.*${w}x${h}.*${virt_out}"; then
     info "$virt_out is already on at ${w}x${h} — reusing it."
   else
-    if ! xrandr | grep -q "$mode_name"; then
-      info "Creating ${mode_name} mode…"
-      local modeline name rest
-      if have cvt; then
-        modeline=$(cvt "$w" "$h" 60 | grep Modeline)
-      elif have gtf; then
-        modeline=$(gtf "$w" "$h" 60 | grep Modeline)
-      else
-        die "Neither cvt nor gtf found. Run: ipad-display install"
-      fi
-      # shellcheck disable=SC2086
-      read -r _ name rest <<< "$modeline"
-      name=${name//\"/}
-      # shellcheck disable=SC2086
-      xrandr --newmode "$name" $rest
-    fi
-    xrandr --addmode "$virt_out" "$mode_name" 2>/dev/null || true
     info "Enabling $virt_out at ${w}x${h}, positioned $pos of $primary…"
     case "$pos" in
       right) xrandr --output "$virt_out" --mode "$mode_name" --right-of "$primary" ;;
@@ -318,59 +337,64 @@ x11_destroy_virtual() {
 }
 
 # =====================================================================
-# Wayland/GNOME: virtual monitor via mutter D-Bus API
+# Wayland/GNOME: virtual monitor
+#
+# History lesson: mutter used to expose CreateVirtualMonitor on
+# org.gnome.Mutter.DisplayConfig (GNOME 40 era), but current mutter removed it
+# — verified against GNOME's own source: the interface has no such method.
+# So on current GNOME there is no software-only way to conjure a display at
+# runtime. The honest fallbacks: a dummy HDMI plug, or a GNOME-on-X11 session.
 # =====================================================================
-wayland_create_virtual() { # W H SCALE -> sets VIRT_INDEX
-  local w="$1" h="$2" scale="$3"
-  have gdbus || die "gdbus not found (glib2) — cannot talk to mutter."
+MUTTER_BUS="org.gnome.Mutter.DisplayConfig"
+MUTTER_OBJ="/org/gnome/Mutter/DisplayConfig"
+MUTTER_IFACE="org.gnome.Mutter.DisplayConfig"
+MUTTER_VIRT_SIG=""
 
-  local bus="org.gnome.Mutter.DisplayConfig"
-  local obj="/org/gnome/Mutter/DisplayConfig"
-  local iface="org.gnome.Mutter.DisplayConfig"
-
+# Prints the CreateVirtualMonitor method block (gdbus text format), or empty.
+mutter_virtual_method_block() {
   local introspect
-  introspect=$(gdbus introspect --session --dest "$bus" --object-path "$obj" 2>/dev/null) \
-    || die "Cannot reach mutter on D-Bus. This path needs a GNOME/Wayland session."
-
-  # NOTE: `gdbus introspect` prints a pretty text format, e.g.:
+  introspect=$(gdbus introspect --session --dest "$MUTTER_BUS" --object-path "$MUTTER_OBJ" 2>/dev/null) || return 1
+  # NOTE: `gdbus introspect` prints pretty text, e.g.
   #     CreateVirtualMonitor(in  u width,
   #                          in  u height,
   #                          in  d scale);
   # (not raw D-Bus XML), so parse that.
-  local method_block
-  method_block=$(echo "$introspect" | awk '
+  echo "$introspect" | awk '
     /^[[:space:]]*CreateVirtualMonitor\(/ { capture=1 }
     capture { buf = buf $0 "\n" }
     capture && /\);/ { printf "%s", buf; exit }
-  ')
-  [ -n "$method_block" ] || die "Your mutter has no CreateVirtualMonitor API.
+  '
+}
 
-Your GNOME/mutter may be too old, or this isn't a standard GNOME session.
-Options:
-  • Log into a GNOME/X11 session instead (xrandr VIRTUAL path).
-  • Or use a cheap (~\$8) HDMI dummy plug, which works everywhere."
+# Returns 0 when mutter exposes CreateVirtualMonitor; sets MUTTER_VIRT_SIG.
+mutter_has_virtual_api() {
+  have gdbus || return 1
+  local block sig
+  block=$(mutter_virtual_method_block) || return 1
+  [ -n "$block" ] || return 1
+  sig=$(echo "$block" | grep -o 'in[[:space:]]\+[a-z]' | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
+  [ -n "$sig" ] || return 1
+  MUTTER_VIRT_SIG="$sig"
+  return 0
+}
 
-  # Input signature, e.g. "u u d".
-  local sig
-  sig=$(echo "$method_block" | grep -o 'in[[:space:]]\+[a-z]' | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
-  [ -n "$sig" ] || die "Found CreateVirtualMonitor but could not parse its signature.
-Please share the output of: ipad-display status"
+wayland_create_virtual() { # W H SCALE -> sets VIRT_INDEX (call mutter_has_virtual_api first)
+  local w="$1" h="$2" scale="$3"
 
   local -a args=()
-  case "$sig" in
+  case "$MUTTER_VIRT_SIG" in
     "u u d") args=(uint32 "$w" uint32 "$h" double "$scale") ;;
     *)
-      die "Unexpected CreateVirtualMonitor signature [$sig] on your mutter.
-Please share the output of: ipad-display status
-and I'll adapt the call."
+      die "Unexpected CreateVirtualMonitor signature [$MUTTER_VIRT_SIG].
+Please share the output of: ipad-display status"
       ;;
   esac
 
   local before after
   before=$(xrandr --listmonitors 2>/dev/null || true)
   info "Asking mutter to create a ${w}x${h} virtual monitor…"
-  gdbus call --session --dest "$bus" --object-path "$obj" \
-    --method "$iface.CreateVirtualMonitor" "${args[@]}" >/dev/null \
+  gdbus call --session --dest "$MUTTER_BUS" --object-path "$MUTTER_OBJ" \
+    --method "$MUTTER_IFACE.CreateVirtualMonitor" "${args[@]}" >/dev/null \
     || die "mutter refused to create the virtual monitor."
   sleep 1
   after=$(xrandr --listmonitors 2>/dev/null || true)
@@ -386,6 +410,35 @@ and I'll adapt the call."
 Open Sunshine's web UI (https://localhost:47990) and pick the new display manually."
   ok "Virtual monitor live (display index $VIRT_INDEX, ${w}x${h})."
   info "Arrange it in Settings → Displays (drag it to the side you like)."
+}
+
+# Called when mutter has no virtual-monitor API: explain, snapshot monitors,
+# and point at the real options. Streaming setup still happens in cmd_start.
+wayland_no_api_notice() {
+  mkdir -p "$STATE_DIR"
+  if have xrandr; then
+    xrandr --listmonitors 2>/dev/null > "$MONITOR_SNAPSHOT" || true
+    ok "Saved your current monitor layout."
+  else
+    warn "xrandr not found — run: ipad-display install"
+  fi
+  step "Heads up: no software virtual display on this GNOME version"
+  cat <<'EOF'
+  Current GNOME removed the D-Bus call that let scripts create virtual
+  monitors (it existed a few years back; upstream took it out). So a
+  purely software second screen isn't possible here — but two easy
+  alternatives are:
+
+  1. Dummy HDMI plug (~$8): a tiny adapter that makes the laptop think a
+     real monitor is connected. Plug it into any HDMI port, then run:
+         ipad-display attach
+     This is the recommended route — zero config, works everywhere.
+
+  2. GNOME on X11: at the login screen, click the gear icon and pick
+     "GNOME on X11" if it's offered, log in, then re-run:
+         ipad-display start
+     (The xrandr virtual-display path works there on Intel graphics.)
+EOF
 }
 
 wayland_destroy_virtual() {
@@ -460,6 +513,75 @@ sunshine_set_output() { # $1 = display index
 }
 
 # =====================================================================
+# attach — bind Sunshine to a newly-appeared display (dummy HDMI plug, or a
+# display that showed up after switching sessions). Run after `start` told you
+# to plug something in.
+# =====================================================================
+cmd_attach() {
+  local res="" output_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --res) res="$2"; shift 2 ;;
+      --output) output_override="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (see: ipad-display --help)" ;;
+    esac
+  done
+  if [ -n "$res" ]; then
+    [[ "$res" =~ ^[0-9]+x[0-9]+$ ]] || die "--res must look like 1920x1440 (got '$res')."
+  fi
+  have xrandr || die "xrandr not found. Run: ipad-display install"
+
+  step "Looking for the new display"
+  local current idx=""
+  current=$(xrandr --listmonitors 2>/dev/null) || die "xrandr --listmonitors failed."
+
+  if [ -n "$output_override" ]; then
+    idx="$output_override"
+  elif [ -f "$MONITOR_SNAPSHOT" ]; then
+    local new_lines count
+    new_lines=$(comm -13 <(sort "$MONITOR_SNAPSHOT") <(echo "$current" | sort) \
+      | grep -E '^[[:space:]]*[0-9]+:')
+    count=$(echo "$new_lines" | grep -c . || true)
+    if [ "$count" -eq 1 ]; then
+      idx=$(echo "$new_lines" | awk '{print $1}' | tr -d ':')
+      ok "New display detected at index $idx."
+    else
+      warn "Found $count new displays since the snapshot (expected exactly 1):"
+      echo "$current" | sed 's/^/    /'
+      [ "$count" -eq 0 ] && warn "Is the dummy plug (or second monitor) connected and powered?"
+      die "Re-run with: ipad-display attach --output N"
+    fi
+  else
+    echo "Current displays:"
+    echo "$current" | sed 's/^/    /'
+    die "No earlier snapshot to compare with. Re-run with: ipad-display attach --output N"
+  fi
+
+  local name
+  name=$(echo "$current" | awk -v i="$idx:" '$1 == i {print $NF}')
+  [ -n "$name" ] || die "No display with index $idx. Check: xrandr --listmonitors"
+  info "Display: $name (index $idx)"
+
+  if [ -n "$res" ]; then
+    local w="${res%x*}" h="${res#*x}" mode
+    mode=$(xrandr_ensure_mode "$name" "$w" "$h")
+    if xrandr --output "$name" --mode "$mode"; then
+      ok "$name set to ${w}x${h}."
+    else
+      warn "Could not switch $name to $mode — pick a resolution in Settings → Displays."
+    fi
+  fi
+
+  VIRT_INDEX="$idx"
+  step "Starting the stream (Sunshine)"
+  sunshine_ensure_running
+  sunshine_set_output "$VIRT_INDEX"
+  info "Arrange the new display in Settings → Displays (drag it to the side you like)."
+  cmd_pair
+}
+
+# =====================================================================
 # start / stop / status / pair
 # =====================================================================
 cmd_start() {
@@ -483,15 +605,22 @@ cmd_start() {
   local w="${res%x*}" h="${res#*x}"
 
   local st="${XDG_SESSION_TYPE:-unknown}" de="${XDG_CURRENT_DESKTOP:-unknown}"
-  step "Session: $de on $st — creating a ${w}x${h} virtual monitor"
+  step "Session: $de on $st — setting up a ${w}x${h} second display"
 
   VIRT_INDEX=""
+  local need_attach=0
   case "$st" in
     x11)
       x11_create_virtual "$w" "$h" "$pos" ;;
     wayland)
       case "$de" in
-        *GNOME*) wayland_create_virtual "$w" "$h" "$scale" ;;
+        *GNOME*)
+          if mutter_has_virtual_api; then
+            wayland_create_virtual "$w" "$h" "$scale"
+          else
+            need_attach=1
+            wayland_no_api_notice
+          fi ;;
         *) die "Wayland virtual monitors are only automated for GNOME/mutter.
 For other compositors, a cheap (~\$8) HDMI dummy plug + Sunshine works well." ;;
       esac ;;
@@ -501,8 +630,21 @@ For other compositors, a cheap (~\$8) HDMI dummy plug + Sunshine works well." ;;
   [ -n "$output_override" ] && VIRT_INDEX="$output_override"
 
   if [ "$monitor_only" -eq 1 ]; then
-    ok "Monitor-only mode: virtual display is up, nothing is streaming."
-    info "Detected Sunshine display index: ${VIRT_INDEX:-unknown}"
+    ok "Monitor-only mode: nothing is streaming."
+    if [ "$need_attach" -eq 1 ]; then
+      info "Next: get the extra display connected, then run: ipad-display attach"
+    else
+      info "Detected Sunshine display index: ${VIRT_INDEX:-unknown}"
+    fi
+    return 0
+  fi
+
+  if [ "$need_attach" -eq 1 ]; then
+    step "Preparing the stream (Sunshine)"
+    sunshine_ensure_running
+    ok "All set on this end."
+    info "Next step: plug in the dummy HDMI adapter (or log into GNOME on X11),"
+    info "then run:  ipad-display attach [--res 1920x1440]"
     return 0
   fi
 
@@ -592,6 +734,7 @@ main() {
   case "$cmd" in
     install) shift; cmd_install "$@" ;;
     start)   shift; cmd_start "$@" ;;
+    attach)  shift; cmd_attach "$@" ;;
     stop)    shift; cmd_stop "$@" ;;
     status)  shift; cmd_status "$@" ;;
     pair)    shift; cmd_pair "$@" ;;
