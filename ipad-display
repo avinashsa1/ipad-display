@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+#
+# ipad-display — use your iPad as a wireless extended display for your Fedora laptop.
+#
+# How it works:
+#   1. Creates a *virtual monitor* inside your current desktop session
+#      (X11: xrandr VIRTUAL output · Wayland/GNOME: mutter D-Bus API),
+#      so you can drag windows onto it like a real second screen.
+#   2. Streams exactly that monitor with Sunshine (low-latency, GPU-encoded).
+#   3. You view and control it from the free Moonlight app on your iPad.
+#
+# Usage: ipad-display <install|start|stop|status|pair> [options]
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+DEFAULT_RES="1920x1440"
+DEFAULT_POS="right"
+DEFAULT_SCALE="1.0"
+SUNSHINE_CONF="${HOME}/.config/sunshine/sunshine.conf"
+
+# ---------- pretty output ----------
+if [ -t 1 ]; then
+  C_BOLD=$'\e[1m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'
+  C_RED=$'\e[31m'; C_CYAN=$'\e[36m'; C_DIM=$'\e[2m'; C_RESET=$'\e[0m'
+else
+  C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""; C_DIM=""; C_RESET=""
+fi
+info() { printf '%s=>%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+step() { printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+laptop_ips() {
+  hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^127\.' | grep -v '^::1' | grep -v '^$' || true
+}
+
+usage() {
+  cat <<EOF
+${C_BOLD}ipad-display${C_RESET} v${VERSION} — iPad as a wireless extended display (Fedora laptop)
+
+${C_BOLD}Commands:${C_RESET}
+  install                 Install Sunshine + helpers, open firewall ports
+  start [--res WxH] [--pos right|left|above|below] [--scale S] [--output N] [--monitor-only]
+                          Create the virtual monitor and start streaming it
+  stop                    Turn the virtual monitor back off
+  status                  Show session, monitors, Sunshine and network state
+  pair                    Re-print the iPad (Moonlight) pairing steps
+
+${C_BOLD}Examples:${C_RESET}
+  ipad-display install
+  ipad-display start                       # 1920x1440 virtual screen, right of laptop
+  ipad-display start --res 2360x1640       # match an 11" iPad Air/Pro
+  ipad-display stop
+
+On your iPad: install the free ${C_BOLD}Moonlight${C_RESET} app (App Store), join the same
+Wi-Fi as the laptop, add the laptop by IP, enter the PIN in Sunshine's web UI.
+EOF
+}
+
+# =====================================================================
+# install
+# =====================================================================
+cmd_install() {
+  step "Installing dependencies"
+  have dnf || die "dnf not found — this tool targets Fedora."
+
+  info "Requesting sudo up front (COPR + packages + firewall)…"
+  sudo -v || die "Need sudo for installation."
+
+  if ! have sunshine; then
+    info "Enabling the official LizardByte COPR and installing Sunshine…"
+    sudo dnf copr enable -y lizardbyte/stable
+    # NOTE: the package name is case-sensitive.
+    sudo dnf install -y Sunshine
+  else
+    ok "Sunshine already installed ($(sunshine --version 2>/dev/null | head -n1 || echo unknown))."
+  fi
+
+  if ! have xrandr || ! have cvt; then
+    info "Installing xrandr/cvt helpers…"
+    sudo dnf install -y xorg-x11-server-utils
+  else
+    ok "xrandr/cvt present."
+  fi
+
+  step "Opening firewall ports for Sunshine/Moonlight"
+  # TCP: 47984/47989/47990/48010 · UDP: 47998-48010 (video, control, discovery)
+  sudo firewall-cmd --permanent --add-port=47984/tcp --add-port=47989/tcp \
+    --add-port=47990/tcp --add-port=48010/tcp >/dev/null
+  sudo firewall-cmd --permanent --add-port=47998-48010/udp >/dev/null
+  sudo firewall-cmd --reload >/dev/null
+  ok "Firewall ports open."
+
+  if [ -e /dev/uinput ]; then
+    if ! groups | grep -qw input; then
+      info "Adding you to the 'input' group so Sunshine can inject mouse/keyboard…"
+      sudo usermod -aG input "$USER"
+      warn "Log out and back in once for the 'input' group to take effect."
+    fi
+  fi
+
+  step "Done"
+  ok "Run: ipad-display start"
+  info "First run will ask you to create a Sunshine web-UI login at https://localhost:47990"
+}
+
+# =====================================================================
+# X11: virtual monitor via xrandr VIRTUAL outputs (Intel iGPUs)
+# =====================================================================
+x11_create_virtual() { # W H POS  -> sets VIRT_INDEX
+  local w="$1" h="$2" pos="$3"
+  have xrandr || die "xrandr not found. Run: ipad-display install"
+
+  local virt_out
+  virt_out=$(xrandr | grep -E '^VIRTUAL[0-9]+ disconnected' | head -n1 | awk '{print $1}')
+  [ -n "$virt_out" ] || die "No disconnected VIRTUAL output found in xrandr.
+
+This usually means your GPU driver doesn't expose virtual outputs
+(typical on AMD/NVIDIA proprietary drivers under X11).
+Options:
+  • Log into a GNOME/Wayland session instead — ipad-display can create the
+    virtual monitor there via mutter's D-Bus API (no driver support needed).
+  • Or use a cheap (~\$8) HDMI dummy plug, which makes any GPU expose an output."
+
+  local primary
+  primary=$(xrandr | grep ' connected primary' | head -n1 | awk '{print $1}')
+  [ -n "$primary" ] || primary=$(xrandr | grep ' connected' | head -n1 | awk '{print $1}')
+  [ -n "$primary" ] || die "No connected display found?!"
+
+  local mode_name="${w}x${h}_60.00"
+  if xrandr | grep -q " connected.*${w}x${h}.*${virt_out}"; then
+    info "$virt_out is already on at ${w}x${h} — reusing it."
+  else
+    if ! xrandr | grep -q "$mode_name"; then
+      info "Creating ${mode_name} mode…"
+      local modeline name rest
+      if have cvt; then
+        modeline=$(cvt "$w" "$h" 60 | grep Modeline)
+      elif have gtf; then
+        modeline=$(gtf "$w" "$h" 60 | grep Modeline)
+      else
+        die "Neither cvt nor gtf found. Run: ipad-display install"
+      fi
+      # shellcheck disable=SC2086
+      read -r _ name rest <<< "$modeline"
+      name=${name//\"/}
+      # shellcheck disable=SC2086
+      xrandr --newmode "$name" $rest
+    fi
+    xrandr --addmode "$virt_out" "$mode_name" 2>/dev/null || true
+    info "Enabling $virt_out at ${w}x${h}, positioned $pos of $primary…"
+    case "$pos" in
+      right) xrandr --output "$virt_out" --mode "$mode_name" --right-of "$primary" ;;
+      left)  xrandr --output "$virt_out" --mode "$mode_name" --left-of "$primary" ;;
+      above) xrandr --output "$virt_out" --mode "$mode_name" --above "$primary" ;;
+      below) xrandr --output "$virt_out" --mode "$mode_name" --below "$primary" ;;
+    esac
+  fi
+  ok "Virtual monitor live: $virt_out (${w}x${h})"
+
+  VIRT_INDEX=$(xrandr --listmonitors 2>/dev/null \
+    | grep -E "[[:space:]]${w}/[0-9]+x${h}/" | head -n1 | awk '{print $1}' | tr -d ':')
+  [ -n "$VIRT_INDEX" ] || die "Virtual monitor is on, but I couldn't find its index via xrandr --listmonitors."
+  info "Sunshine display index for it: $VIRT_INDEX"
+}
+
+x11_destroy_virtual() {
+  have xrandr || return 0
+  local on
+  on=$(xrandr | grep -E '^VIRTUAL[0-9]+ connected' | awk '{print $1}')
+  if [ -z "$on" ]; then
+    info "No VIRTUAL output is currently on."
+    return 0
+  fi
+  for o in $on; do
+    xrandr --output "$o" --off
+    ok "Turned off $o."
+  done
+}
+
+# =====================================================================
+# Wayland/GNOME: virtual monitor via mutter D-Bus API
+# =====================================================================
+wayland_create_virtual() { # W H SCALE -> sets VIRT_INDEX
+  local w="$1" h="$2" scale="$3"
+  have gdbus || die "gdbus not found (glib2) — cannot talk to mutter."
+
+  local bus="org.gnome.Mutter.DisplayConfig"
+  local obj="/org/gnome/Mutter/DisplayConfig"
+  local iface="org.gnome.Mutter.DisplayConfig"
+
+  local introspect
+  introspect=$(gdbus introspect --session --dest "$bus" --object-path "$obj" 2>/dev/null) \
+    || die "Cannot reach mutter on D-Bus. This path needs a GNOME/Wayland session."
+
+  echo "$introspect" | grep -q 'name="CreateVirtualMonitor"' \
+    || die "Your mutter has no CreateVirtualMonitor API.
+
+Options:
+  • Log into a GNOME/X11 session instead (xrandr VIRTUAL path).
+  • Or use a cheap (~\$8) HDMI dummy plug, which works everywhere."
+
+  # Read the method's input signature so we call it correctly, e.g. "u u d".
+  local sig
+  sig=$(echo "$introspect" \
+    | awk '/<method name="CreateVirtualMonitor">/,/<\/method>/' \
+    | grep 'direction="in"' \
+    | sed -n 's/.*type="\([a-z]\)".*/\1/p' | tr '\n' ' ' | sed 's/ $//')
+
+  local -a args=()
+  case "$sig" in
+    "u u d") args=(uint32 "$w" uint32 "$h" double "$scale") ;;
+    *)
+      die "Unexpected CreateVirtualMonitor signature [$sig] on your mutter.
+Please share the output of: ipad-display status
+and I'll adapt the call."
+      ;;
+  esac
+
+  local before after
+  before=$(xrandr --listmonitors 2>/dev/null || true)
+  info "Asking mutter to create a ${w}x${h} virtual monitor…"
+  gdbus call --session --dest "$bus" --object-path "$obj" \
+    --method "$iface.CreateVirtualMonitor" "${args[@]}" >/dev/null \
+    || die "mutter refused to create the virtual monitor."
+  sleep 1
+  after=$(xrandr --listmonitors 2>/dev/null || true)
+
+  VIRT_INDEX=$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort) \
+    | head -n1 | awk '{print $1}' | tr -d ':')
+  if [ -z "$VIRT_INDEX" ]; then
+    # Fallback: match by geometry.
+    VIRT_INDEX=$(echo "$after" | grep -E "[[:space:]]${w}/[0-9]+x${h}/" \
+      | head -n1 | awk '{print $1}' | tr -d ':')
+  fi
+  [ -n "$VIRT_INDEX" ] || die "Virtual monitor was created, but I couldn't spot it in xrandr --listmonitors.
+Open Sunshine's web UI (https://localhost:47990) and pick the new display manually."
+  ok "Virtual monitor live (display index $VIRT_INDEX, ${w}x${h})."
+  info "Arrange it in Settings → Displays (drag it to the side you like)."
+}
+
+wayland_destroy_virtual() {
+  local bus="org.gnome.Mutter.DisplayConfig"
+  local obj="/org/gnome/Mutter/DisplayConfig"
+  local introspect
+  introspect=$(gdbus introspect --session --dest "$bus" --object-path "$obj" 2>/dev/null || true)
+  local releaser
+  releaser=$(echo "$introspect" | grep -o 'name="[A-Za-z]*[Rr]elease[A-Za-z]*"' | head -n1 | sed 's/name="//;s/"//')
+  if [ -n "$releaser" ]; then
+    gdbus call --session --dest "$bus" --object-path "$obj" \
+      --method "org.gnome.Mutter.DisplayConfig.$releaser" >/dev/null 2>&1 && ok "Virtual monitor released."
+  else
+    warn "mutter offers no D-Bus call to remove the virtual monitor — it disappears when you log out."
+    info "You can also disable it any time in Settings → Displays."
+  fi
+}
+
+# =====================================================================
+# Sunshine management
+# =====================================================================
+sunshine_launch() {
+  info "Starting Sunshine…"
+  # Prefer the packaged user service when it exists.
+  if systemctl --user list-unit-files 2>/dev/null | grep -q '^sunshine\.service'; then
+    systemctl --user start sunshine 2>/dev/null || true
+  fi
+  if ! pgrep -x sunshine >/dev/null 2>&1; then
+    if have sunshine; then
+      nohup sunshine >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+    else
+      die "Sunshine is not installed. Run: ipad-display install"
+    fi
+  fi
+  local i
+  for i in $(seq 1 20); do
+    if curl -sk --max-time 2 https://localhost:47990/ >/dev/null 2>&1; then
+      ok "Sunshine web UI is up at https://localhost:47990"
+      return 0
+    fi
+    sleep 1
+  done
+  die "Sunshine didn't come up on port 47990. Try running 'sunshine' in a terminal to see the error."
+}
+
+sunshine_ensure_running() {
+  if pgrep -x sunshine >/dev/null 2>&1 && curl -sk --max-time 2 https://localhost:47990/ >/dev/null 2>&1; then
+    ok "Sunshine already running."
+  else
+    sunshine_launch
+  fi
+}
+
+sunshine_set_output() { # $1 = display index
+  local idx="$1"
+  mkdir -p "$(dirname "$SUNSHINE_CONF")"
+  [ -f "$SUNSHINE_CONF" ] || : > "$SUNSHINE_CONF"
+  local tmp="${SUNSHINE_CONF}.tmp.$$"
+  grep -v '^[[:space:]]*output_name[[:space:]]*=' "$SUNSHINE_CONF" > "$tmp" || true
+  printf 'output_name = %s\n' "$idx" >> "$tmp"
+  mv "$tmp" "$SUNSHINE_CONF"
+  ok "Sunshine will stream display index $idx (saved to sunshine.conf)."
+  info "Restarting Sunshine to pick up the change…"
+  if systemctl --user is-active --quiet sunshine 2>/dev/null; then
+    systemctl --user restart sunshine
+  elif pgrep -x sunshine >/dev/null 2>&1; then
+    pkill -x sunshine
+    sleep 1
+    sunshine_launch
+  fi
+}
+
+# =====================================================================
+# start / stop / status / pair
+# =====================================================================
+cmd_start() {
+  local res="$DEFAULT_RES" pos="$DEFAULT_POS" scale="$DEFAULT_SCALE"
+  local output_override="" monitor_only=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --res)    res="$2"; shift 2 ;;
+      --pos)    pos="$2"; shift 2 ;;
+      --scale)  scale="$2"; shift 2 ;;
+      --output) output_override="$2"; shift 2 ;;
+      --monitor-only) monitor_only=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (see: ipad-display --help)" ;;
+    esac
+  done
+
+  [[ "$res" =~ ^[0-9]+x[0-9]+$ ]] || die "--res must look like 1920x1440 (got '$res')."
+  case "$pos" in right|left|above|below) ;; *) die "--pos must be right|left|above|below." ;; esac
+  local w="${res%x*}" h="${res#*x}"
+
+  local st="${XDG_SESSION_TYPE:-unknown}" de="${XDG_CURRENT_DESKTOP:-unknown}"
+  step "Session: $de on $st — creating a ${w}x${h} virtual monitor"
+
+  VIRT_INDEX=""
+  case "$st" in
+    x11)
+      x11_create_virtual "$w" "$h" "$pos" ;;
+    wayland)
+      case "$de" in
+        *GNOME*) wayland_create_virtual "$w" "$h" "$scale" ;;
+        *) die "Wayland virtual monitors are only automated for GNOME/mutter.
+For other compositors, a cheap (~\$8) HDMI dummy plug + Sunshine works well." ;;
+      esac ;;
+    *) die "Unknown session type '$st'. Run this inside your graphical session." ;;
+  esac
+
+  [ -n "$output_override" ] && VIRT_INDEX="$output_override"
+
+  if [ "$monitor_only" -eq 1 ]; then
+    ok "Monitor-only mode: virtual display is up, nothing is streaming."
+    info "Detected Sunshine display index: ${VIRT_INDEX:-unknown}"
+    return 0
+  fi
+
+  step "Starting the stream (Sunshine)"
+  sunshine_ensure_running
+  sunshine_set_output "$VIRT_INDEX"
+
+  cmd_pair
+}
+
+cmd_stop() {
+  local st="${XDG_SESSION_TYPE:-unknown}" de="${XDG_CURRENT_DESKTOP:-unknown}"
+  step "Turning off the virtual monitor"
+  case "$st" in
+    x11) x11_destroy_virtual ;;
+    wayland)
+      case "$de" in
+        *GNOME*) wayland_destroy_virtual ;;
+        *) info "Nothing automated for this session type." ;;
+      esac ;;
+  esac
+  info "Sunshine left running so you can re-pair instantly. Stop it with: pkill sunshine"
+}
+
+cmd_status() {
+  step "ipad-display status"
+  printf '  Session:      %s on %s\n' "${XDG_CURRENT_DESKTOP:-?}" "${XDG_SESSION_TYPE:-?}"
+  printf '  Sunshine:     %s\n' "$(have sunshine && echo "installed" || echo "${C_RED}not installed${C_RESET} (run: ipad-display install)")"
+  printf '  Running:      %s\n' "$(pgrep -x sunshine >/dev/null 2>&1 && echo yes || echo no)"
+  if [ -f "$SUNSHINE_CONF" ]; then
+    printf '  output_name:  %s\n' "$(grep -E '^[[:space:]]*output_name' "$SUNSHINE_CONF" | tail -n1 || echo '(not set)')"
+  fi
+  echo "  Monitors:"
+  if have xrandr; then
+    xrandr --listmonitors 2>/dev/null | sed 's/^/    /' || echo "    (xrandr unavailable)"
+  else
+    echo "    (xrandr not installed)"
+  fi
+  echo "  Laptop IPs (use one on your iPad):"
+  laptop_ips | sed 's/^/    /' || echo "    (none found)"
+  echo "  Firewall (Sunshine ports):"
+  if have firewall-cmd; then
+    sudo -n firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -E '479(8[49]|90)|48010' | sed 's/^/    /' || echo "    (not open or no passwordless sudo)"
+  fi
+  printf '  %sTip:%s if anything looks wrong, run: ipad-display start\n' "$C_DIM" "$C_RESET"
+}
+
+cmd_pair() {
+  local ip
+  ip=$(laptop_ips | head -n1)
+  [ -n "$ip" ] || ip="<your-laptop-ip>"
+  step "Pair your iPad (one-time setup)"
+  cat <<EOF
+  ${C_BOLD}On the laptop (once):${C_RESET}
+    1. Open ${C_CYAN}https://localhost:47990${C_RESET} and create a Sunshine username + password.
+    2. Keep this terminal handy — you'll type a PIN there in step 5.
+
+  ${C_BOLD}On the iPad:${C_RESET}
+    3. Install ${C_BOLD}Moonlight${C_RESET} (free, App Store) and join the ${C_BOLD}same Wi-Fi${C_RESET} as the laptop.
+    4. Tap ${C_BOLD}+${C_RESET} → enter ${C_CYAN}${ip}${C_RESET} → Moonlight shows a 4-digit PIN.
+    5. In Sunshine's web UI, type that PIN in the box and hit ${C_BOLD}Send${C_RESET}.
+    6. Tap the laptop in Moonlight — your virtual display appears. Drag windows onto it!
+
+  ${C_BOLD}Nice-to-knows:${C_RESET}
+    • Touch works as a mouse; Apple Pencil too. Two-finger tap = right-click.
+    • In Moonlight settings: 60 FPS, and HEVC/H.265 if your iPad supports it.
+    • Use 5 GHz Wi-Fi for the smoothest experience; keep the laptop plugged in
+      and disable auto-suspend (Settings → Power).
+    • Resolution too small/big? Re-run:  ipad-display start --res 2360x1640
+EOF
+}
+
+# =====================================================================
+# main
+# =====================================================================
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install) shift; cmd_install "$@" ;;
+    start)   shift; cmd_start "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    pair)    shift; cmd_pair "$@" ;;
+    -h|--help|help) usage ;;
+    -v|--version) echo "ipad-display v$VERSION" ;;
+    *) err "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
